@@ -13,11 +13,18 @@ class GSM {
     /**
      * 
      * @param {String} path - A path to the GSM Modem device (ex: '/dev/gsmmodem')
+     * @param {object} options - An options object
+     * @param {?number} options.baudRate - The baudrate to use, defaults to 460800
      */
-    constructor(path) {
+    constructor(path, options) {
         this.path = path
         this.connected = false
-        this.serialPort = new SerialPort(path, { baudRate: 460800, autoOpen: false })
+        this.isWaiting = false
+        this.gpsIsOn = false
+        this.serialPort = new SerialPort(path, {
+            baudRate: options?.baudRate ?? 460800,
+            autoOpen: false
+        })
         this.parser = new Parser()
     }
 
@@ -25,6 +32,9 @@ class GSM {
      * Connects to GSM modem serial port. 
      */
     async connect() {
+        if (this.connected) {
+            throw new Error('Already connected');
+        }
         return new Promise((resolve, reject) => {
             this.serialPort.open((error) => {
                 if (error) {
@@ -376,53 +386,96 @@ class GSM {
         return await this.runCommand(`AT+CMGD=0,${filter}`)
     }
 
+    async turnGPSOn() {
+		console.log('debug-turnon');
+        const reply = await this.runCommand(`AT+CGNSPWR=1`)
+        this.gpsIsOn = true
+        return reply
+    }
+
+    async turnGPSOff() {
+		console.log('debug-turnoff');
+        const reply = await this.runCommand(`AT+CGNSPWR=1`)
+        this.gpsIsOn = false
+        return reply
+    }
+
+    async getGPSPosition() {
+        if (!this.gpsIsOn) {
+            await this.turnGPSOn()
+        }
+		console.log('fetch');
+        const reply = await this.runCommand(`AT+CGNSINF`)
+        const list = reply.split(",")
+        const datetime = list[2]
+        return {
+            datetime: datetime.slice(8, 10)+':'+datetime.slice(10, 12)+':'+datetime.slice(12, 14),
+            latitude: list[3],
+            longitude: list[4],
+            altitude: list[5],
+            rawReply: reply
+        }
+    }
+
+    /**
+     * 
+     * @param {string} command 
+     * @param {number} timeout 
+     * @returns {Promise<string>}
+     */
     async runCommand(command, timeout) {
         if(!timeout) { timeout = TIMEOUT_DEFAULT }
         return new Promise((resolve, reject) => {
-            if (!this.connected) { return reject("Not Connected") }
+            try {
+                if (!this.connected) { return reject(new Error("Not Connected")) }
+                if (this.isWaiting) { return reject(new Error("Cannot run command while already waiting for another")) }
+                this.isWaiting = true
 
-            let timeoutHandle = setTimeout(() => {
-                reject("Timeout")
-            },timeout)
-            
-            let output = ""
-            const dataHandler = (data) => {
-                output += data.toString('utf8').trim()
+                let timeoutHandle = setTimeout(() => {
+                    reject(new Error("Timeout waiting for command"))
+                    this.serialPort.removeListener('data', dataHandler)
+                    this.isWaiting = false
+                },timeout)
 
-                if (output.endsWith(GSM.ReturnCode.ok) || output.endsWith(GSM.ReturnCode.error) || output.endsWith(GSM_PROMPT)) { 
-                    clearTimeout(timeoutHandle)
-                    this.serialPort.removeListener('data', dataHandler) 
-                } 
+                let output = ""
+                const dataHandler = (data) => {
+                    output += data.toString('utf8').trim()
 
-                // OK message - success
-                if (output.endsWith(GSM.ReturnCode.ok)) {
-                    setTimeout(() => {
-                        resolve(output.slice(0, -GSM.ReturnCode.ok.length).trim())
-                    },20)
-                    return
+					const endOutput = () => {
+                        clearTimeout(timeoutHandle)
+                        this.serialPort.removeListener('data', dataHandler)
+                        this.isWaiting = false
+					}
+
+                    // OK message - success
+                    if (output.endsWith(GSM.ReturnCode.ok)) {
+						endOutput()
+                        setTimeout(() => { resolve(output.slice(0, -GSM.ReturnCode.ok.length).trim()) },20)
+                        return
+                    }
+
+                    // ERROR message - failure
+                    else if (output.endsWith(GSM.ReturnCode.error)) {
+						endOutput()
+                        setTimeout(() => { reject(new Error('Error from modem: ' + output.slice(0, -GSM.ReturnCode.error).trim())) },20)
+                        return
+                    }
+
+                    // > message - prompt for user data
+                    else if (output.endsWith(GSM_PROMPT)) {
+						endOutput()
+                        setTimeout(() => { resolve(output) },20)
+                        return
+                    }
+                    else {
+                        // partial message, wait for more data
+                    }
                 }
-
-                // ERROR message - failure
-                else if (output.endsWith(GSM.ReturnCode.error)) {
-                    setTimeout(() => {
-                        reject(output)
-                    },20)
-                    return
-                }
-
-                // > message - prompt for user data
-                else if (output.endsWith(GSM_PROMPT)) {
-                    setTimeout(() => {
-                        resolve(output)
-                    },20)
-                    return
-                }
-                else {
-                    // partial message, wait for more data
-                }
+                this.serialPort.on('data', dataHandler)
+                this.serialPort.write(`${command}\r\n`)
+            } catch (err) {
+                reject(err);
             }
-            this.serialPort.on('data', dataHandler)
-            this.serialPort.write(`${command}\r\n`)
         })
     }
 

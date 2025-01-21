@@ -18,7 +18,9 @@ module.exports = class Parser {
             description = this.dbmDescription(dbm)
         }
 
-        return { description, dbm,
+        return {
+			description,
+			dbm,
             bitErrorRate: this.berDescription(bitErrorRate)
         }
     }
@@ -60,23 +62,38 @@ module.exports = class Parser {
     parseTextMessageResult(result) {
         const list = result.split("\r\n")
         let messages = []
-        for (let i = 0; i < list.length; i += 2) {
-            const parts = list[i].replace("+CMGL: ","").split(",")
-            
+        for (let i = 0; i < list.length; i += 1) {
+			const plainStr = list[i]
+			const rawStr = plainStr.replace(/\+CMGL: ?/,"").replace(/AT\+CMGL=\"[^"]+\"/, "").trim()
+            if (rawStr.length === 0) {
+				continue;
+			}
+            const parts = rawStr.split(",")
             const index = parseInt(parts[0])
             const status = parts[1].trimQuotes()
             const sender = parts[2].trimQuotes().decodedUCS2Hex()
             const date = parts[4].trimQuotes().replace(/\//g,"-")
             const time = parts[5].trimQuotes()
             const numberType = parseInt(parts[6])
-            const textLength = parseInt(parts[7])
-            const messageText = list[i+1]
+			const lastPart = parts[parts.length - 1];
 
+			let textLength;
+			let messageText;
+			if (lastPart.length > 3) {
+				const lastPartLengthMod4 = lastPart.length % 4;
+				textLength = parseInt(lastPart.slice(0, lastPartLengthMod4));
+				messageText = lastPart.slice(lastPartLengthMod4);
+			} else {
+				textLength = parseInt(lastPart)
+				messageText = list[++i]
+			}
+			
             // Message Text decode. Can be either UTF-8 or UCS2. We check this by the char byte size
             const textBuffer = Buffer.from(messageText,"hex")
             const textCharSize = textBuffer.length / textLength
             const decodedText = textCharSize == 2 ? messageText.decodedUCS2Hex() : textBuffer.toString("utf-8")
-            
+			const finalText = decodedText.replace(/\x00/g, '');
+
             //Time calculate
             const timeParts = time.split("+")
             const timezone = parseFloat(timeParts[1])/4.0 * 100
@@ -89,9 +106,9 @@ module.exports = class Parser {
                 status: status,
                 sender: senderString,
                 time: new Date(timeStamp),
-                text: decodedText,
+                text: finalText,
                 numberType: numberType,
-                rawHeader: list[i],
+                rawHeader: plainStr,
                 rawMessage: messageText,
             })
         }
